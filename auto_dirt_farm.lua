@@ -1,155 +1,127 @@
 --[[
     Auto Dirt Farm — Human Action + Anti-Ban
     GrowLauncher Lua API (Lua 5.4)
-
-    Fitur Utama:
-    - Break baris GENAP (2, 4, 6, ...)
-    - Plant baris GANJIL (1, 3, 5, ...)
-    - Stop otomatis jika dirt habis + notifikasi
-    - Lava avoidance
-    - Maksimal human behavior & anti-ban
-
-    Human Behavior System:
-    - Gaussian-like random delay (tidak seragam)
-    - Fatigue system (makin lama makin lambat)
-    - Random idle/pause (seolah distraksi)
-    - Punch offset (tidak selalu tepat tengah tile)
-    - Fake actions (buka inventory, gerak kecil)
-    - Speed burst (kadang tiba-tiba cepat)
-    - Arah sweep alternating (kiri→kanan / kanan→kiri bergantian)
-    - Micro-correction (sesekali salah tile lalu koreksi)
-    - Session break (istirahat setelah beberapa menit)
+    v1.2 — Fix: place packet, equip item, koordinat, OnValue rename,
+                doPlace beda dari doPunch, batas world 100x54
 ]]
 
 -- ============================================================
--- REQUIRE & PERSISTENT CONFIG
+-- REQUIRE & CONFIG
 -- ============================================================
 local pref = require("preferences")
 local cfg  = pref:new("auto_dirt_farm.json")
+cfg:load()
 
 -- ============================================================
 -- CONSTANTS
 -- ============================================================
 local DIRT_ID  = 2
+-- ID 8=Lava, 10=Lava2, 674=Acid Lava
 local LAVA_IDS = { [8]=true, [10]=true, [674]=true }
 
--- Range default
+-- World Growtopia: 100x54 tile (index 0-99 x, 0-53 y)
+-- Baris paling bawah = bedrock (y=54-59), jangan disentuh
+local WORLD_MAX_X = 99
+local WORLD_MAX_Y = 53
+
+-- Range default (tile coordinate, bukan pixel)
 local START_X       = cfg:get("start_x",    1)
 local START_Y       = cfg:get("start_y",    3)
-local END_X         = cfg:get("end_x",      99)
-local END_ROW_COUNT = cfg:get("row_count",  20)
+local END_X         = cfg:get("end_x",      98)
+local END_ROW_COUNT = cfg:get("row_count",  10)
 
 -- Delay dasar (ms)
-local BASE_PUNCH_MIN = 180
-local BASE_PUNCH_MAX = 320
-local BASE_PLACE_MIN = 160
-local BASE_PLACE_MAX = 280
+local BASE_PUNCH_MIN = 200
+local BASE_PUNCH_MAX = 350
+local BASE_PLACE_MIN = 180
+local BASE_PLACE_MAX = 300
 
--- Human behavior config (bisa diubah via GUI)
-local IDLE_CHANCE            = 4    -- 1/N chance per tile → idle
-local BURST_CHANCE           = 8    -- 1/N chance → speed burst
-local FAKE_ACTION_CHANCE     = 12   -- 1/N chance → fake action
-local MICRO_CORRECT_CHANCE   = 15   -- 1/N chance → micro-correction
-local SESSION_BREAK_INTERVAL = 180  -- detik sebelum istirahat panjang
-local SESSION_BREAK_MIN      = 4000 -- ms istirahat min
-local SESSION_BREAK_MAX      = 9000 -- ms istirahat max
-local FATIGUE_RATE           = 0.0008  -- kenaikan delay per tile
-local MAX_FATIGUE            = 0.45    -- maks 45% tambahan delay
+-- Human behavior config
+local IDLE_CHANCE            = 4
+local BURST_CHANCE           = 8
+local FAKE_ACTION_CHANCE     = 12
+local MICRO_CORRECT_CHANCE   = 15
+local SESSION_BREAK_INTERVAL = 180
+local SESSION_BREAK_MIN      = 4000
+local SESSION_BREAK_MAX      = 9000
+local FATIGUE_RATE           = 0.0008
+local MAX_FATIGUE            = 0.45
 
 -- ============================================================
 -- STATE
 -- ============================================================
 local State = {
-    running        = false,
-    totalBroken    = 0,
-    totalPlanted   = 0,
-    fatigue        = 0.0,
-    burstLeft      = 0,
-    sessionStart   = 0,
-    lastBreakTime  = 0,
-    tileCount      = 0,
+    running       = false,
+    totalBroken   = 0,
+    totalPlanted  = 0,
+    fatigue       = 0.0,
+    burstLeft     = 0,
+    tileCount     = 0,
+    lastBreakTime = 0,
 }
 
 -- ============================================================
 -- HUMAN BEHAVIOR HELPERS
 -- ============================================================
-
--- Gaussian-like delay: rata-rata 3 random = distribusi natural
 local function humanDelay(min, max)
     local r = (math.random() + math.random() + math.random()) / 3
     local base = min + r * (max - min)
-    local fatigueBonus = base * State.fatigue
-    return math.floor(base + fatigueBonus)
+    return math.floor(base + base * State.fatigue)
 end
 
--- Update fatigue per tile
 local function updateFatigue()
     State.tileCount = State.tileCount + 1
     State.fatigue = math.min(MAX_FATIGUE, State.tileCount * FATIGUE_RATE)
 end
 
--- Session break setelah interval tertentu
 local function checkSessionBreak()
     local now = os.clock()
     if (now - State.lastBreakTime) >= SESSION_BREAK_INTERVAL then
         local dur = math.random(SESSION_BREAK_MIN, SESSION_BREAK_MAX)
-        log("[Human] Istirahat " .. math.floor(dur/1000) .. " detik...")
+        log("[Human] Istirahat " .. math.floor(dur/1000) .. "s...")
         growtopia.notify("Santai sebentar...")
         CSleep(dur)
         State.lastBreakTime = os.clock()
         State.fatigue = math.max(0, State.fatigue - 0.1)
-        log("[Human] Lanjut!")
     end
 end
 
--- Random idle seolah distraksi
 local function maybeIdle()
     if math.random(IDLE_CHANCE) == 1 then
-        local ms = math.random(600, 4000)
-        log("[Human] Idle " .. ms .. "ms")
-        CSleep(ms)
+        CSleep(math.random(600, 4000))
     end
 end
 
--- Fake actions: buka inventory / gerak kecil / pause
 local function maybeFakeAction()
     if math.random(FAKE_ACTION_CHANCE) ~= 1 then return end
     local roll = math.random(3)
     if roll == 1 then
-        -- Buka inventory
-        log("[Human] Fake: buka inventory")
         sendPacket(2, "action|dialog_request\ndialog_name|backpack\n")
         CSleep(math.random(500, 1800))
         sendPacket(2, "action|dialog_cancel\n")
         CSleep(math.random(200, 400))
     elseif roll == 2 then
-        -- Gerak kecil
-        log("[Human] Fake: gerak kecil")
         local p = getLocal()
         if p then
             sendPacketRaw(false, {
                 type=0, value=0,
-                x=p.posX+12, y=p.posY,
-                xspeed=80, yspeed=0,
-                px=p.posX//32, py=p.posY//32
+                x=p.posX+14, y=p.posY,
+                xspeed=100, yspeed=0,
+                px=math.floor(p.posX/32), py=math.floor(p.posY/32)
             })
             CSleep(math.random(120, 300))
             sendPacketRaw(false, {
                 type=0, value=0,
                 x=p.posX, y=p.posY,
                 xspeed=0, yspeed=0,
-                px=p.posX//32, py=p.posY//32
+                px=math.floor(p.posX/32), py=math.floor(p.posY/32)
             })
         end
-        CSleep(math.random(100, 250))
     else
-        -- Pause lihat layar
-        log("[Human] Fake: pause")
-        CSleep(math.random(1000, 2800))
+        CSleep(math.random(800, 2500))
     end
 end
 
--- Speed burst: beberapa tile berikutnya lebih cepat
 local function isBursting()
     if State.burstLeft > 0 then
         State.burstLeft = State.burstLeft - 1
@@ -157,22 +129,19 @@ local function isBursting()
     end
     if math.random(BURST_CHANCE) == 1 then
         State.burstLeft = math.random(3, 7)
-        log("[Human] Speed burst " .. State.burstLeft .. " tiles")
         return true
     end
     return false
 end
 
--- Micro-correction: sesekali punch tile sebelah lalu koreksi
 local function maybeMicroCorrect(tx, ty)
     if math.random(MICRO_CORRECT_CHANCE) ~= 1 then return end
     local dirs = {{-1,0},{1,0},{0,-1},{0,1}}
     local d = dirs[math.random(#dirs)]
     local wx, wy = tx + d[1], ty + d[2]
-    if wx < 0 or wy < 0 or wx > END_X or wy > (START_Y + END_ROW_COUNT) then return end
+    if wx < 0 or wy < 0 or wx > WORLD_MAX_X or wy > WORLD_MAX_Y then return end
     local t = getTile(wx, wy)
     if t and t.fg ~= 0 and not LAVA_IDS[t.fg] then
-        log("[Human] Micro-correct punch " .. wx .. "," .. wy)
         sendPacketRaw(false, {
             type=3, value=18,
             x=wx*32 + math.random(-6,6),
@@ -183,7 +152,7 @@ local function maybeMicroCorrect(tx, ty)
     end
 end
 
--- Punch offset: tidak selalu tepat tengah tile
+-- Offset punch (tidak selalu tepat tengah tile)
 local function ox() return math.random(-8, 8) end
 local function oy() return math.random(-6, 6) end
 
@@ -191,6 +160,7 @@ local function oy() return math.random(-6, 6) end
 -- UTILITY
 -- ============================================================
 local function isDangerous(tx, ty)
+    if tx < 0 or ty < 0 or tx > WORLD_MAX_X or ty > WORLD_MAX_Y then return true end
     local t = getTile(tx, ty)
     if not t then return false end
     if LAVA_IDS[t.fg] or LAVA_IDS[t.bg] then return true end
@@ -202,7 +172,8 @@ end
 local function isPlayerSafe()
     local p = getLocal()
     if not p then return false end
-    local tx, ty = p.posX // 32, p.posY // 32
+    local tx = math.floor(p.posX / 32)
+    local ty = math.floor(p.posY / 32)
     for dx = -1, 1 do
         for dy = -1, 1 do
             local t = getTile(tx+dx, ty+dy)
@@ -220,24 +191,43 @@ local function getDirtCount()
 end
 
 -- ============================================================
--- CORE: Punch sekali dengan offset
+-- EQUIP ITEM — kirim packet pilih item di tangan
+-- FIX: Sebelum place, harus equip dirt dulu
+-- ============================================================
+local function equipItem(itemId)
+    sendPacket(2, "action|item_activate\nnetid|-1\nitem_id|" .. itemId .. "\n")
+    CSleep(humanDelay(80, 150))
+end
+
+-- ============================================================
+-- CORE: Punch (break) tile
+-- type=3 = PACKET_TILE_CHANGE_REQUEST
+-- value=18 = punch/fist
 -- ============================================================
 local function doPunch(tx, ty)
     sendPacketRaw(false, {
-        type=3, value=18,
-        x=tx*32 + ox(), y=ty*32 + oy(),
-        px=tx, py=ty
+        type  = 3,
+        value = 18,    -- fist punch
+        x     = tx * 32 + ox(),
+        y     = ty * 32 + oy(),
+        px    = tx,
+        py    = ty
     })
 end
 
 -- ============================================================
--- CORE: Place sekali dengan offset
+-- CORE: Place tile (beda dari punch!)
+-- FIX: value = item ID yang diplace (DIRT_ID = 2)
+--      Harus equip item dulu sebelum place
 -- ============================================================
 local function doPlace(tx, ty)
     sendPacketRaw(false, {
-        type=3, value=18,
-        x=tx*32 + ox(), y=ty*32 + oy(),
-        px=tx, py=ty
+        type  = 3,
+        value = DIRT_ID,   -- FIX: bukan 18! ini ID item yang diplace
+        x     = tx * 32 + ox(),
+        y     = ty * 32 + oy(),
+        px    = tx,
+        py    = ty
     })
 end
 
@@ -248,12 +238,12 @@ local function breakTile(tx, ty)
     local t = getTile(tx, ty)
     if not t or t.fg == 0 then return true end
     if isDangerous(tx, ty) then
-        log("[Farm] Skip berbahaya " .. tx .. "," .. ty)
+        log("[Farm] Skip tile berbahaya " .. tx .. "," .. ty)
         return true
     end
 
     FindPath(tx, ty)
-    CSleep(humanDelay(200, 450))
+    CSleep(humanDelay(180, 400))
 
     local attempts = 0
     while State.running do
@@ -265,10 +255,10 @@ local function breakTile(tx, ty)
         end
 
         if not isPlayerSafe() then
-            log("[Farm] Bahaya lava! Mundur...")
-            growtopia.notify("Bahaya lava! Pause...")
+            log("[Farm] Bahaya lava! Pause...")
+            growtopia.notify("Bahaya! Pause 2s")
             CSleep(2000)
-            FindPath(START_X, START_Y - 1)
+            FindPath(START_X, START_Y)
             CSleep(humanDelay(500, 900))
         end
 
@@ -282,10 +272,8 @@ local function breakTile(tx, ty)
             CSleep(humanDelay(BASE_PUNCH_MIN, BASE_PUNCH_MAX))
         end
 
-        maybeFakeAction()
-
-        if attempts >= 32 then
-            log("[Farm] Skip tile " .. tx .. "," .. ty .. " (tidak bisa break)")
+        if attempts >= 35 then
+            log("[Farm] Skip tile " .. tx .. "," .. ty .. " (max attempts)")
             return false
         end
     end
@@ -293,9 +281,11 @@ local function breakTile(tx, ty)
 end
 
 -- ============================================================
--- CORE: Plant tile
+-- CORE: Place dirt di tile
+-- FIX: equip dirt dulu, lalu place dengan value=DIRT_ID
 -- ============================================================
 local function plantTile(tx, ty)
+    -- Kalau ada fg, break dulu
     local t = getTile(tx, ty)
     if t and t.fg ~= 0 then
         breakTile(tx, ty)
@@ -304,8 +294,11 @@ local function plantTile(tx, ty)
 
     if getDirtCount() <= 0 then return false end
 
+    -- FIX: Equip dirt sebelum place!
+    equipItem(DIRT_ID)
+
     FindPath(tx, ty)
-    CSleep(humanDelay(150, 320))
+    CSleep(humanDelay(150, 300))
 
     doPlace(tx, ty)
     State.totalPlanted = State.totalPlanted + 1
@@ -321,81 +314,93 @@ local function plantTile(tx, ty)
 end
 
 -- ============================================================
--- PHASE: BREAK — baris GENAP, arah alternating
+-- PHASE: BREAK — baris GENAP (index 1,3,5,...)
+-- Growtopia tile Y: 0 = atas, WORLD_MAX_Y = bawah
 -- ============================================================
 local function doBreakPhase()
-    log("[Farm] BREAK phase mulai...")
+    log("[Farm] === BREAK PHASE ===")
+    log("[Farm] Area: X=" .. START_X .. "-" .. END_X .. " Y=" .. START_Y .. " +" .. END_ROW_COUNT .. " baris")
     State.lastBreakTime = os.clock()
 
     for row = 0, END_ROW_COUNT - 1 do
         if not State.running then return end
-        if row % 2 == 1 then   -- baris GENAP (index 1,3,5,...)
+
+        if row % 2 == 1 then  -- baris genap (index 1,3,5,...)
             local ty = START_Y + row
+            if ty > WORLD_MAX_Y then break end
+
             local goLeft = (math.floor(row / 2) % 2 == 1)
             local xStart = goLeft and END_X   or START_X
             local xEnd   = goLeft and START_X or END_X
             local xStep  = goLeft and -1       or 1
 
-            log("[Farm] Break Y=" .. ty .. (goLeft and " (←)" or " (→)"))
+            log("[Farm] Break Y=" .. ty .. (goLeft and " <--" or " -->"))
 
             local tx = xStart
-            while State.running and ((xStep>0 and tx<=xEnd) or (xStep<0 and tx>=xEnd)) do
+            while State.running do
+                if xStep > 0 and tx > xEnd   then break end
+                if xStep < 0 and tx < xEnd   then break end
+                if tx < 0 or tx > WORLD_MAX_X then break end
+
                 checkSessionBreak()
                 maybeIdle()
+
                 if not isDangerous(tx, ty) then
                     breakTile(tx, ty)
                 end
+
                 tx = tx + xStep
-                CSleep(humanDelay(25, 70))
+                CSleep(humanDelay(20, 60))
             end
 
-            log("[Farm] Baris " .. ty .. " done | broken=" .. State.totalBroken)
-            CSleep(humanDelay(300, 1000))
+            log("[Farm] Y=" .. ty .. " selesai | broken=" .. State.totalBroken)
+            maybeFakeAction()
+            CSleep(humanDelay(300, 900))
         end
     end
 
     log("[Farm] BREAK selesai! Total: " .. State.totalBroken)
-    growtopia.notify("Break selesai! " .. State.totalBroken .. " tile.")
+    growtopia.notify("Break selesai! " .. State.totalBroken .. " tile")
 end
 
 -- ============================================================
--- PHASE: PLANT — baris GANJIL, arah alternating
+-- PHASE: PLANT — baris GANJIL (index 0,2,4,...)
 -- ============================================================
 local function doPlantPhase()
-    log("[Farm] PLANT phase mulai...")
+    log("[Farm] === PLANT PHASE ===")
+    log("[Farm] Dirt tersedia: " .. getDirtCount())
     State.lastBreakTime = os.clock()
 
     for row = 0, END_ROW_COUNT - 1 do
         if not State.running then return end
-        if row % 2 == 0 then   -- baris GANJIL (index 0,2,4,...)
+
+        if row % 2 == 0 then  -- baris ganjil (index 0,2,4,...)
             local ty = START_Y + row
+            if ty > WORLD_MAX_Y then break end
+
             local goLeft = (math.floor(row / 2) % 2 == 1)
             local xStart = goLeft and END_X   or START_X
             local xEnd   = goLeft and START_X or END_X
             local xStep  = goLeft and -1       or 1
 
-            log("[Farm] Plant Y=" .. ty .. (goLeft and " (←)" or " (→)"))
+            log("[Farm] Plant Y=" .. ty .. (goLeft and " <--" or " -->"))
 
             local tx = xStart
-            while State.running and ((xStep>0 and tx<=xEnd) or (xStep<0 and tx>=xEnd)) do
+            while State.running do
+                if xStep > 0 and tx > xEnd    then break end
+                if xStep < 0 and tx < xEnd    then break end
+                if tx < 0 or tx > WORLD_MAX_X then break end
 
-                -- Cek dirt
                 local dirtLeft = getDirtCount()
                 if dirtLeft <= 0 then
                     log("[Farm] Dirt habis!")
-                    growtopia.notify("Dirt habis! Kumpulkan lagi.")
-                    sendVariant({
-                        v1 = "OnAddNotification",
-                        v2 = "interface/large/chest_golden.rttex",
-                        v3 = "Dirt habis! Kumpulkan lagi dulu.",
-                        v4 = "audio/item_punch.wav"
-                    })
+                    growtopia.notify("Dirt habis! Stop.")
                     State.running = false
                     return
                 end
-
                 if dirtLeft <= 10 then
                     growtopia.notify("Dirt sisa " .. dirtLeft .. "!")
+                    log("[Farm] WARNING: Dirt sisa " .. dirtLeft)
                 end
 
                 checkSessionBreak()
@@ -404,26 +409,20 @@ local function doPlantPhase()
                 maybeFakeAction()
 
                 tx = tx + xStep
-                CSleep(humanDelay(20, 60))
+                CSleep(humanDelay(20, 55))
             end
 
-            log("[Farm] Baris " .. ty .. " planted | dirt=" .. getDirtCount())
-            CSleep(humanDelay(300, 900))
+            log("[Farm] Y=" .. ty .. " planted | dirt=" .. getDirtCount())
+            CSleep(humanDelay(300, 800))
         end
     end
 
-    log("[Farm] PLANT selesai! Total: " .. State.totalPlanted)
-    growtopia.notify("Plant selesai! " .. State.totalPlanted .. " dirt.")
-    sendVariant({
-        v1 = "OnAddNotification",
-        v2 = "interface/large/chest_golden.rttex",
-        v3 = "Plant selesai! " .. State.totalPlanted .. " dirt tertanam.",
-        v4 = "audio/item_equip.wav"
-    })
+    log("[Farm] PLANT selesai! Total planted: " .. State.totalPlanted)
+    growtopia.notify("Plant selesai! " .. State.totalPlanted .. " dirt")
 end
 
 -- ============================================================
--- MAIN
+-- MAIN FARM LOOP
 -- ============================================================
 local function startFarm()
     State.totalBroken   = 0
@@ -431,29 +430,30 @@ local function startFarm()
     State.fatigue       = 0.0
     State.burstLeft     = 0
     State.tileCount     = 0
-    State.sessionStart  = os.clock()
     State.lastBreakTime = os.clock()
 
-    log("[Farm] Auto Dirt Farm dimulai!")
-    log("[Farm] World: " .. GetWorldName())
-    log("[Farm] Dirt : " .. getDirtCount())
+    log("[Farm] =====================")
+    log("[Farm] Auto Dirt Farm v1.2")
+    log("[Farm] World : " .. (GetWorldName() or "N/A"))
+    log("[Farm] Dirt  : " .. getDirtCount())
+    log("[Farm] Area  : X" .. START_X .. "-" .. END_X ..
+        " Y" .. START_Y .. " (" .. END_ROW_COUNT .. " baris)")
+    log("[Farm] =====================")
 
-    -- Jeda awal natural
-    CSleep(humanDelay(1000, 3000))
+    -- Jeda awal
+    CSleep(humanDelay(800, 2000))
 
     if State.running then doBreakPhase() end
-
-    if State.running then
-        CSleep(humanDelay(1500, 4000))
-    end
-
+    if State.running then CSleep(humanDelay(1000, 3000)) end
     if State.running then doPlantPhase() end
 
     if State.running then
-        log("[Farm] Semua fase selesai! Broken=" .. State.totalBroken .. " Planted=" .. State.totalPlanted)
+        log("[Farm] SEMUA SELESAI! Broken=" .. State.totalBroken .. " Planted=" .. State.totalPlanted)
+        growtopia.notify("Farm selesai!")
     end
 
     State.running = false
+    log("[Farm] Stopped.")
 end
 
 -- ============================================================
@@ -461,41 +461,45 @@ end
 -- ============================================================
 local ui = UserInterface.new("Auto Dirt Farm", "Grass")
 ui:addLabelApp("Auto Dirt Farm", "Grass")
-ui:addTooltip("Info", "Break baris genap, plant baris ganjil. Human behavior maksimal.", "Info", false)
+ui:addTooltip("Info",
+    "Break baris genap, plant baris ganjil. World: 100x54 tile (0-99, 0-53).",
+    "Info", false)
 ui:addDivider()
 ui:addToggle("Enable Farm", cfg:get("enabled", false), "enable_farm", false)
 ui:addDivider()
 
 local expCfg = ui:addExpandableToggle("Range Config", false, "cfg_exp", false, true)
-ui:addChildInputInt(expCfg.list_child, "Start X",   tostring(START_X),       "X", "Tile X awal",        "Home", "cfg_start_x")
-ui:addChildInputInt(expCfg.list_child, "Start Y",   tostring(START_Y),       "Y", "Tile Y awal",        "Home", "cfg_start_y")
-ui:addChildInputInt(expCfg.list_child, "End X",     tostring(END_X),         "X", "Tile X akhir",       "Home", "cfg_end_x")
-ui:addChildInputInt(expCfg.list_child, "Row Count", tostring(END_ROW_COUNT), "N", "Jumlah baris total", "Home", "cfg_row_count")
+ui:addChildInputInt(expCfg.list_child, "Start X",   tostring(START_X),       "X", "Tile X awal (0-99)",     "Home", "cfg_start_x")
+ui:addChildInputInt(expCfg.list_child, "Start Y",   tostring(START_Y),       "Y", "Tile Y awal (0-53)",     "Home", "cfg_start_y")
+ui:addChildInputInt(expCfg.list_child, "End X",     tostring(END_X),         "X", "Tile X akhir (0-99)",    "Home", "cfg_end_x")
+ui:addChildInputInt(expCfg.list_child, "Row Count", tostring(END_ROW_COUNT), "N", "Jumlah baris (max 54)",  "Home", "cfg_row_count")
 
 local expH = ui:addExpandableToggle("Human Behavior", false, "human_exp", false, true)
-ui:addChildSlider(expH.list_child, "Idle Chance (1/N)",   2, 20,  IDLE_CHANCE,            1, false, "idle_chance")
-ui:addChildSlider(expH.list_child, "Burst Chance (1/N)",  4, 20,  BURST_CHANCE,           1, false, "burst_chance")
-ui:addChildSlider(expH.list_child, "Fake Action (1/N)",   5, 30,  FAKE_ACTION_CHANCE,     1, false, "fake_chance")
-ui:addChildSlider(expH.list_child, "Session Break (det)", 60, 600, SESSION_BREAK_INTERVAL, 10, false, "session_break")
+ui:addChildSlider(expH.list_child, "Idle Chance (1/N)",    2,   20,  IDLE_CHANCE,            1, false, "idle_chance")
+ui:addChildSlider(expH.list_child, "Burst Chance (1/N)",   4,   20,  BURST_CHANCE,           1, false, "burst_chance")
+ui:addChildSlider(expH.list_child, "Fake Action (1/N)",    5,   30,  FAKE_ACTION_CHANCE,     1, false, "fake_chance")
+ui:addChildSlider(expH.list_child, "Session Break (detik)",60, 600, SESSION_BREAK_INTERVAL, 10, false, "session_break")
 
 -- ============================================================
 -- HOOKS
+-- FIX: OnValue → OnValueFarm supaya tidak bentrok dengan gl_console
 -- ============================================================
-function OnValue(type, name, value)
+function OnValueFarm(type, name, value)
     if name == "enable_farm" then
         if value and not State.running then
             State.running = true
             cfg:set("enabled", true) cfg:save()
+            log("[Farm] Dimulai!")
             runThread(startFarm)
         elseif not value then
             State.running = false
             cfg:set("enabled", false) cfg:save()
             log("[Farm] Dihentikan.")
         end
-    elseif name == "cfg_start_x"   then START_X = tonumber(value) or START_X; cfg:set("start_x", START_X); cfg:save()
-    elseif name == "cfg_start_y"   then START_Y = tonumber(value) or START_Y; cfg:set("start_y", START_Y); cfg:save()
-    elseif name == "cfg_end_x"     then END_X = tonumber(value) or END_X; cfg:set("end_x", END_X); cfg:save()
-    elseif name == "cfg_row_count" then END_ROW_COUNT = tonumber(value) or END_ROW_COUNT; cfg:set("row_count", END_ROW_COUNT); cfg:save()
+    elseif name == "cfg_start_x"   then START_X = math.max(0, math.min(WORLD_MAX_X, tonumber(value) or START_X)); cfg:set("start_x", START_X); cfg:save()
+    elseif name == "cfg_start_y"   then START_Y = math.max(0, math.min(WORLD_MAX_Y, tonumber(value) or START_Y)); cfg:set("start_y", START_Y); cfg:save()
+    elseif name == "cfg_end_x"     then END_X = math.max(0, math.min(WORLD_MAX_X, tonumber(value) or END_X)); cfg:set("end_x", END_X); cfg:save()
+    elseif name == "cfg_row_count" then END_ROW_COUNT = math.max(1, math.min(54, tonumber(value) or END_ROW_COUNT)); cfg:set("row_count", END_ROW_COUNT); cfg:save()
     elseif name == "idle_chance"   then IDLE_CHANCE = tonumber(value) or IDLE_CHANCE
     elseif name == "burst_chance"  then BURST_CHANCE = tonumber(value) or BURST_CHANCE
     elseif name == "fake_chance"   then FAKE_ACTION_CHANCE = tonumber(value) or FAKE_ACTION_CHANCE
@@ -503,18 +507,19 @@ function OnValue(type, name, value)
     end
 end
 
-function OnDraw(d)
-    removeHook("OnDraw")
+function OnDrawFarm(d)
+    removeHook("OnDrawFarm")
     runCoroutine(function()
-        sleep(6000)
+        sleep(5000)
         addCategory("Farming", "Grass")
         addIntoModule(ui:generateJSON(), "Farming")
     end)
 end
 
-addHook(OnValue, "OnValue")
-addHook(OnDraw, "OnDraw")
+addHook(OnValueFarm, "OnValue")
+addHook(OnDrawFarm,  "OnDraw")
 applyHook()
 
-log("[Auto Dirt Farm] Loaded! Buka modul 'Farming' di GL.")
+log("[Auto Dirt Farm] v1.2 loaded!")
 log("[Auto Dirt Farm] Dirt: " .. getDirtCount())
+log("[Auto Dirt Farm] Buka modul 'Farming' di GL.")
